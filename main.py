@@ -692,12 +692,13 @@ def build_punishment_view(
     case_id: int,
     old_rank: discord.Role | None = None,
     new_rank: discord.Role | None = None,
+    banner_filename: str = PUNISHMENT_BANNER_FILENAME,
 ) -> discord.ui.LayoutView:
     layout = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_color=discord.Color.from_rgb(54, 57, 63))
     gallery = discord.ui.MediaGallery()
     gallery.add_item(
-        media=f"attachment://{PUNISHMENT_BANNER_FILENAME}",
+        media=f"attachment://{banner_filename}",
         description="Arkansas State Roleplay Staff Discipline",
     )
     container.add_item(gallery)
@@ -779,7 +780,7 @@ def build_promotion_view(
             "### ⚠️ Zero Tolerance Period (1 week): "
             f"Active until {ztp_expires_at}\n\n"
             "### Any punishment other than a warning during this period will be "
-            "escalated to a **Demotion to Awaiting Training**, and your in-game "
+            "escalated to a **Termination**, and your in-game "
             "permissions will be removed.\n\n"
             if ztp_id is not None and ztp_expires_at is not None
             else ""
@@ -2192,6 +2193,27 @@ def get_active_activity_checks() -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def recover_interrupted_activity_checks() -> None:
+    initialize_database()
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE activity_checks SET status = 'active' WHERE status = 'processing'"
+        )
+        connection.execute(
+            "UPDATE activity_check_members SET status = 'punished', case_id = ("
+            "SELECT case_id FROM punishment_cases "
+            "WHERE punishment_cases.activity_check_id = activity_check_members.check_id "
+            "AND punishment_cases.member_id = activity_check_members.member_id "
+            "AND punishment_cases.status = 'active' "
+            "ORDER BY punishment_cases.case_id DESC LIMIT 1) "
+            "WHERE status = 'pending' AND EXISTS ("
+            "SELECT 1 FROM punishment_cases "
+            "WHERE punishment_cases.activity_check_id = activity_check_members.check_id "
+            "AND punishment_cases.member_id = activity_check_members.member_id "
+            "AND punishment_cases.status = 'active')"
+        )
+
+
 async def issue_activity_check_punishment(
     guild: discord.Guild,
     member: discord.Member,
@@ -2201,11 +2223,30 @@ async def issue_activity_check_punishment(
 ) -> tuple[int | None, str | None]:
     if punishment not in {"Infraction", "Strike", "Termination", "Warning"}:
         return None, f"Unsupported activity-check punishment: {punishment}."
+    if not ACTIVITY_CHECK_BANNER_PATH.is_file():
+        return None, "The activity-check banner is missing from the bot's deployed files."
+    with database_connection() as connection:
+        existing_case = connection.execute(
+            "SELECT * FROM punishment_cases "
+            "WHERE activity_check_id = ? AND member_id = ? AND status = 'pending' "
+            "ORDER BY case_id DESC LIMIT 1",
+            (activity_check_id, member.id),
+        ).fetchone()
     case_punishment, projected_counts, converted_case_ids = plan_punishment_escalation(
         member.id,
         guild.id,
         punishment,
     )
+    if existing_case is not None:
+        case_punishment = existing_case["punishment"]
+        projected_counts = {
+            name: get_active_punishment_count(member.id, guild.id, name)
+            for name in PUNISHMENT_ROLE_IDS
+        }
+        if case_punishment == "Termination":
+            projected_counts = {name: 0 for name in PUNISHMENT_ROLE_IDS}
+        elif case_punishment in projected_counts:
+            projected_counts[case_punishment] += 1
     if punishment == "Termination":
         projected_counts = {name: 0 for name in PUNISHMENT_ROLE_IDS}
     bot_member = guild.me
@@ -2242,8 +2283,11 @@ async def issue_activity_check_punishment(
             return None, "I could not access the configured punishment channel."
     if not isinstance(channel, discord.TextChannel):
         return None, "The configured punishment channel is not a text channel."
-    if not channel.permissions_for(bot_member).send_messages:
+    channel_permissions = channel.permissions_for(bot_member)
+    if not channel_permissions.send_messages:
         return None, "I do not have permission to send messages in the punishment channel."
+    if not channel_permissions.attach_files:
+        return None, "I need Attach Files permission in the punishment channel to publish the case."
 
     created_at, _ = eastern_timestamp()
     termination_due_at: str | None = None
@@ -2254,28 +2298,29 @@ async def issue_activity_check_punishment(
     appealable_by = "MGMT+"
     reason = "Failure to react to the activity check"
     original_roles = list(member.roles)
-    case_id = create_case_id()
-    with database_connection() as connection:
-        connection.execute(
-            "UPDATE punishment_cases SET member_id = ?, punishment = ?, reason = ?, "
-            "appealable = 1, appealable_by = ?, status = 'pending', created_at = ?, "
-            "removed_role_ids = ?, guild_id = ?, termination_due_at = ?, "
-            "activity_check_id = ? WHERE case_id = ?",
-            (
-                member.id,
-                case_punishment,
-                reason,
-                appealable_by,
-                created_at,
-                json.dumps(
-                    [role.id for role in roles_to_remove if role.id in STAFF_ROLE_ID_SET]
+    case_id = existing_case["case_id"] if existing_case is not None else create_case_id()
+    if existing_case is None:
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE punishment_cases SET member_id = ?, punishment = ?, reason = ?, "
+                "appealable = 1, appealable_by = ?, status = 'pending', created_at = ?, "
+                "removed_role_ids = ?, guild_id = ?, termination_due_at = ?, "
+                "activity_check_id = ? WHERE case_id = ?",
+                (
+                    member.id,
+                    case_punishment,
+                    reason,
+                    appealable_by,
+                    created_at,
+                    json.dumps(
+                        [role.id for role in roles_to_remove if role.id in STAFF_ROLE_ID_SET]
+                    ),
+                    guild.id,
+                    termination_due_at,
+                    activity_check_id,
+                    case_id,
                 ),
-                guild.id,
-                termination_due_at,
-                activity_check_id,
-                case_id,
-            ),
-        )
+            )
 
     if changes_roles:
         remove_ids = {role.id for role in roles_to_remove}
@@ -2306,11 +2351,17 @@ async def issue_activity_check_punishment(
         proof=f"Activity Check #{activity_check_id}",
         issuer=f"<@{issuer_id}>",
         case_id=case_id,
+        banner_filename=ACTIVITY_CHECK_BANNER_FILENAME,
     )
     try:
         message = await channel.send(
             view=view,
-            files=[discord.File(PUNISHMENT_BANNER_PATH, filename=PUNISHMENT_BANNER_FILENAME)],
+            files=[
+                discord.File(
+                    ACTIVITY_CHECK_BANNER_PATH,
+                    filename=ACTIVITY_CHECK_BANNER_FILENAME,
+                )
+            ],
             allowed_mentions=discord.AllowedMentions(users=[member]),
         )
     except DISCORD_REQUEST_ERRORS as error:
@@ -2381,8 +2432,14 @@ async def issue_activity_check_punishment(
                 proof=f"Activity Check #{activity_check_id}",
                 issuer=f"<@{issuer_id}>",
                 case_id=case_id,
+                banner_filename=ACTIVITY_CHECK_BANNER_FILENAME,
             ),
-            files=[discord.File(PUNISHMENT_BANNER_PATH, filename=PUNISHMENT_BANNER_FILENAME)],
+            files=[
+                discord.File(
+                    ACTIVITY_CHECK_BANNER_PATH,
+                    filename=ACTIVITY_CHECK_BANNER_FILENAME,
+                )
+            ],
             allowed_mentions=discord.AllowedMentions.none(),
         )
     except DISCORD_REQUEST_ERRORS as error:
@@ -2450,6 +2507,7 @@ async def process_activity_check(
     punished = 0
     excused = 0 if excused_row is None else int(excused_row["amount"])
     failed = 0
+    failure_details: list[str] = []
     for participant in participants:
         try:
             member = guild.get_member(participant["member_id"])
@@ -2468,6 +2526,9 @@ async def process_activity_check(
                 f"Could not load member {participant['member_id']} for activity "
                 f"check #{check_id}: {error}"
             )
+            failure_details.append(
+                f"Member {participant['member_id']}: could not load from Discord."
+            )
             with database_connection() as connection:
                 connection.execute(
                     "UPDATE activity_check_members SET status = 'failed' "
@@ -2475,6 +2536,23 @@ async def process_activity_check(
                     (check_id, participant["member_id"]),
                 )
             failed += 1
+            continue
+
+        with database_connection() as connection:
+            existing_active_case = connection.execute(
+                "SELECT case_id FROM punishment_cases "
+                "WHERE activity_check_id = ? AND member_id = ? AND status = 'active' "
+                "ORDER BY case_id DESC LIMIT 1",
+                (check_id, member.id),
+            ).fetchone()
+        if existing_active_case is not None:
+            with database_connection() as connection:
+                connection.execute(
+                    "UPDATE activity_check_members SET status = 'punished', case_id = ? "
+                    "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                    (existing_active_case["case_id"], check_id, member.id),
+                )
+            punished += 1
             continue
 
         if any(role.id == ACTIVITY_CHECK_EXEMPT_ROLE_ID for role in member.roles):
@@ -2498,6 +2576,9 @@ async def process_activity_check(
             print(
                 f"Could not punish member {member.id} for activity check "
                 f"#{check_id}: {error_message}"
+            )
+            failure_details.append(
+                f"{discord.utils.escape_markdown(member.display_name)}: {error_message}"
             )
             with database_connection() as connection:
                 connection.execute(
@@ -2534,15 +2615,32 @@ async def process_activity_check(
             )
             if banner_url is None:
                 print(f"Activity check #{check_id} has no attached banner to preserve.")
+            result_details = (
+                f"Activity check #{check_id} ended. "
+                f"{punished} punished · {excused} excused · {failed} failed."
+            )
+            if failure_details:
+                visible_failures = [
+                    f"- {detail[:240]}" for detail in failure_details[:8]
+                ]
+                remaining = len(failure_details) - len(visible_failures)
+                if remaining:
+                    visible_failures.append(
+                        f"- {remaining} more failure(s); check the bot logs for details."
+                    )
+                result_details += (
+                    "\n\n### Could not issue automatically\n"
+                    + "\n".join(visible_failures)
+                )
             await message.edit(
                 content=None,
                 embeds=[],
                 attachments=message.attachments,
                 view=build_activity_check_layout(
-                    f"Activity check #{check_id} ended. "
-                    f"{punished} punished · {excused} excused · {failed} failed.",
+                    result_details,
                     banner_url,
                 ),
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         except DISCORD_REQUEST_ERRORS as error:
             print(f"Could not update activity check message #{check_id}: {error}")
@@ -2670,6 +2768,7 @@ def get_guild_id() -> int | None:
 class TestBot(commands.Bot):
     async def setup_hook(self) -> None:
         initialize_database()
+        recover_interrupted_activity_checks()
         for action in get_pending_actions():
             action_type = action["action_type"]
             self.add_view(
