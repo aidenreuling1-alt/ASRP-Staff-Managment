@@ -22,6 +22,7 @@ ZTP_LOG_CHANNEL_ID = 1556373690248339497
 UNDER_INVESTIGATION_ROLE_ID = 1517412418915930184
 SUSPENDED_STAFF_ROLE_ID = 1514587990289158184
 RETIRED_STAFF_ROLE_ID = 1513157147578597500
+ACTIVITY_CHECK_EXEMPT_ROLE_ID = 1513157147683197022
 PUNISHMENT_ROLE_IDS: dict[str, tuple[int, int, int]] = {
     "Warning": (1520805516794921153, 1520805603776135322, 1521166004464517221),
     "Infraction": (1521166249155891322, 1521166315346329791, 1521166444287492128),
@@ -199,6 +200,7 @@ def initialize_database() -> None:
             "demotion_new_rank_id": "INTEGER",
             "demotion_added_role_ids": "TEXT",
             "termination_due_at": "TEXT",
+            "activity_check_id": "INTEGER",
         }
         for name, definition in columns.items():
             if name not in existing_columns:
@@ -213,6 +215,20 @@ def initialize_database() -> None:
             "ticket_number TEXT, reason TEXT, result TEXT, "
             "created_at TEXT NOT NULL, message_id INTEGER, "
             "status TEXT NOT NULL DEFAULT 'pending')"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS activity_checks ("
+            "check_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
+            "message_id INTEGER, started_by INTEGER NOT NULL, "
+            "punishment TEXT NOT NULL, ends_at TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS activity_check_members ("
+            "check_id INTEGER NOT NULL, member_id INTEGER NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', case_id INTEGER, "
+            "PRIMARY KEY (check_id, member_id))"
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS promotion_cases ("
@@ -670,7 +686,7 @@ def build_punishment_view(
     appealable: str,
     appealable_by: str,
     proof: str,
-    issuer: discord.Member | discord.User,
+    issuer: discord.Member | discord.User | str,
     case_id: int,
     old_rank: discord.Role | None = None,
     new_rank: discord.Role | None = None,
@@ -705,7 +721,7 @@ def build_punishment_view(
         f"**Appealable:** {appealable}\n"
         f"**Appealable By:** {appealable_by}\n"
         f"**Proof:** {proof}\n"
-        f"**Signed:** {issuer.mention}\n"
+        f"**Signed:** {issuer if isinstance(issuer, str) else issuer.mention}\n"
         f"*Case #{case_id}*"
     )
     container.add_item(discord.ui.TextDisplay(details))
@@ -1419,7 +1435,7 @@ class InfractionAppealModal(discord.ui.Modal, title="Infraction Appeal"):
                 "That case was not found as an infraction or strike on your staff record.",
             )
             return
-        if case["punishment"] == "Warning":
+        if case["punishment"] == "Warning" and case["activity_check_id"] is None:
             await respond_privately(interaction, "Warnings are unappealable.")
             return
         if case["status"] != "active":
@@ -2148,6 +2164,422 @@ class WipeCasesConfirmationView(discord.ui.View):
         self.stop()
 
 
+def get_activity_check(check_id: int) -> sqlite3.Row | None:
+    initialize_database()
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT * FROM activity_checks WHERE check_id = ?",
+            (check_id,),
+        ).fetchone()
+
+
+def get_activity_check_by_message(message_id: int) -> sqlite3.Row | None:
+    initialize_database()
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT * FROM activity_checks WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+
+
+def get_active_activity_checks() -> list[sqlite3.Row]:
+    initialize_database()
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT * FROM activity_checks WHERE status = 'active' AND message_id IS NOT NULL"
+        ).fetchall()
+
+
+async def issue_activity_check_punishment(
+    guild: discord.Guild,
+    member: discord.Member,
+    punishment: str,
+    activity_check_id: int,
+    issuer_id: int,
+) -> tuple[int | None, str | None]:
+    if punishment not in {"Infraction", "Strike", "Termination", "Warning"}:
+        return None, f"Unsupported activity-check punishment: {punishment}."
+    case_punishment, projected_counts, converted_case_ids = plan_punishment_escalation(
+        member.id,
+        guild.id,
+        punishment,
+    )
+    if punishment == "Termination":
+        projected_counts = {name: 0 for name in PUNISHMENT_ROLE_IDS}
+    bot_member = guild.me
+    if bot_member is None:
+        return None, "The bot member is unavailable for role validation."
+
+    if case_punishment == "Termination":
+        roles_to_add: list[discord.Role] = []
+        roles_to_remove = [
+            role for role in member.roles
+            if role.id in STAFF_ROLE_ID_SET | PUNISHMENT_ROLE_ID_SET
+        ]
+    else:
+        role_plan = get_punishment_role_plan(guild, member, projected_counts)
+        if isinstance(role_plan, str):
+            return None, role_plan
+        roles_to_add, roles_to_remove = role_plan
+
+    changes_roles = bool(roles_to_add or roles_to_remove)
+    if changes_roles and (
+        not bot_member.guild_permissions.manage_roles
+        or member.id == guild.owner_id
+        or member.top_role >= bot_member.top_role
+        or any(role >= bot_member.top_role for role in roles_to_add + roles_to_remove)
+    ):
+        return None, "The bot's permissions or role hierarchy prevents applying this punishment."
+
+    channel = guild.get_channel(PUNISHMENT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(PUNISHMENT_CHANNEL_ID)
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not access punishment channel for activity check: {error}")
+            return None, "I could not access the configured punishment channel."
+    if not isinstance(channel, discord.TextChannel):
+        return None, "The configured punishment channel is not a text channel."
+    if not channel.permissions_for(bot_member).send_messages:
+        return None, "I do not have permission to send messages in the punishment channel."
+
+    created_at, _ = eastern_timestamp()
+    termination_due_at: str | None = None
+    if case_punishment == "Strike" and projected_counts["Strike"] >= 3:
+        now = datetime.now(EASTERN_TIME) if EASTERN_TIME else datetime.now().astimezone()
+        termination_due_at = (now + timedelta(hours=24)).isoformat()
+    appealable_text = "✅ Yes"
+    appealable_by = "MGMT+"
+    reason = "Failure to react to the activity check"
+    original_roles = list(member.roles)
+    case_id = create_case_id()
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE punishment_cases SET member_id = ?, punishment = ?, reason = ?, "
+            "appealable = 1, appealable_by = ?, status = 'pending', created_at = ?, "
+            "removed_role_ids = ?, guild_id = ?, termination_due_at = ?, "
+            "activity_check_id = ? WHERE case_id = ?",
+            (
+                member.id,
+                case_punishment,
+                reason,
+                appealable_by,
+                created_at,
+                json.dumps(
+                    [role.id for role in roles_to_remove if role.id in STAFF_ROLE_ID_SET]
+                ),
+                guild.id,
+                termination_due_at,
+                activity_check_id,
+                case_id,
+            ),
+        )
+
+    if changes_roles:
+        remove_ids = {role.id for role in roles_to_remove}
+        if case_punishment == "Termination":
+            remove_ids.update(STAFF_ROLE_ID_SET | PUNISHMENT_ROLE_ID_SET)
+        updated_roles = [role for role in member.roles if role.id not in remove_ids]
+        updated_roles.extend(role for role in roles_to_add if role not in updated_roles)
+        try:
+            await member.edit(
+                roles=updated_roles,
+                reason=f"Activity check punishment case #{case_id}",
+            )
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not apply activity-check case #{case_id} roles: {error}")
+            with database_connection() as connection:
+                connection.execute(
+                    "UPDATE punishment_cases SET status = 'failed' WHERE case_id = ?",
+                    (case_id,),
+                )
+            return None, "Discord could not apply the member's punishment roles."
+
+    view = build_punishment_view(
+        member=member,
+        punishment=case_punishment,
+        reason=reason,
+        appealable=appealable_text,
+        appealable_by=appealable_by,
+        proof=f"Activity Check #{activity_check_id}",
+        issuer=f"<@{issuer_id}>",
+        case_id=case_id,
+    )
+    try:
+        message = await channel.send(
+            view=view,
+            files=[discord.File(PUNISHMENT_BANNER_PATH, filename=PUNISHMENT_BANNER_FILENAME)],
+            allowed_mentions=discord.AllowedMentions(users=[member]),
+        )
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not publish activity-check punishment case #{case_id}: {error}")
+        rollback_error = ""
+        if changes_roles:
+            try:
+                await member.edit(
+                    roles=original_roles,
+                    reason=f"Rolling back unpublished activity-check case #{case_id}",
+                )
+            except DISCORD_REQUEST_ERRORS as rollback_exception:
+                rollback_error = " Role rollback also failed; inspect the member's roles."
+                print(
+                    f"Could not roll back activity-check case #{case_id}: "
+                    f"{rollback_exception}"
+                )
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE punishment_cases SET status = 'failed' WHERE case_id = ?",
+                (case_id,),
+            )
+        return None, f"The punishment post could not be published.{rollback_error}"
+
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE punishment_cases SET status = 'active', message_id = ? WHERE case_id = ?",
+            (message.id, case_id),
+        )
+        if converted_case_ids:
+            connection.executemany(
+                "UPDATE punishment_cases SET status = 'converted' "
+                "WHERE case_id = ? AND status = 'active'",
+                [(converted_case_id,) for converted_case_id in converted_case_ids],
+            )
+    for converted_case_id in converted_case_ids:
+        converted_case = get_case(converted_case_id)
+        if converted_case is not None:
+            await set_original_case_marker(
+                guild,
+                converted_case,
+                f"Converted to case #{case_id}",
+            )
+    if case_punishment != "Warning":
+        triggered_ztp = get_active_ztp(member.id, guild.id)
+        if triggered_ztp is not None:
+            ztp_error = await terminate_for_ztp(
+                guild,
+                member,
+                f"<@{issuer_id}>",
+                triggered_ztp,
+                case_id,
+            )
+            if ztp_error:
+                print(
+                    f"Activity-check case #{case_id} triggered "
+                    f"{format_ztp_id(triggered_ztp['ztp_id'])}, but termination "
+                    f"needs attention: {ztp_error}"
+                )
+    try:
+        await member.send(
+            view=build_punishment_view(
+                member=member,
+                punishment=case_punishment,
+                reason=reason,
+                appealable=appealable_text,
+                appealable_by=appealable_by,
+                proof=f"Activity Check #{activity_check_id}",
+                issuer=f"<@{issuer_id}>",
+                case_id=case_id,
+            ),
+            files=[discord.File(PUNISHMENT_BANNER_PATH, filename=PUNISHMENT_BANNER_FILENAME)],
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not DM activity-check case #{case_id} to member {member.id}: {error}")
+    return case_id, None
+
+
+async def process_activity_check(
+    check_id: int,
+    guild: discord.Guild,
+    punishment_override: str | None = None,
+) -> tuple[int, int, int]:
+    check = get_activity_check(check_id)
+    if check is None or check["guild_id"] != guild.id:
+        return 0, 0, 0
+    with database_connection() as connection:
+        reserved = connection.execute(
+            "UPDATE activity_checks SET status = 'processing' "
+            "WHERE check_id = ? AND status = 'active'",
+            (check_id,),
+        )
+    if reserved.rowcount != 1:
+        return 0, 0, 0
+
+    channel = guild.get_channel(check["channel_id"])
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(check["channel_id"])
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not load activity-check channel #{check_id}: {error}")
+    if isinstance(channel, (discord.TextChannel, discord.Thread)) and check["message_id"]:
+        try:
+            message = await channel.fetch_message(check["message_id"])
+            for reaction in message.reactions:
+                if str(reaction.emoji) != "🟢":
+                    continue
+                async for user in reaction.users(limit=None):
+                    if user.id == (bot.user.id if bot.user is not None else None):
+                        continue
+                    with database_connection() as connection:
+                        connection.execute(
+                            "UPDATE activity_check_members SET status = 'responded' "
+                            "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                            (check_id, user.id),
+                        )
+        except discord.NotFound:
+            print(f"Activity check message #{check_id} was deleted before completion.")
+        except discord.Forbidden as error:
+            print(f"Cannot read reactions for activity check #{check_id}: {error}")
+        except discord.HTTPException as error:
+            print(f"Could not reconcile reactions for activity check #{check_id}: {error}")
+
+    with database_connection() as connection:
+        participants = connection.execute(
+            "SELECT * FROM activity_check_members "
+            "WHERE check_id = ? AND status = 'pending' ORDER BY member_id",
+            (check_id,),
+        ).fetchall()
+        excused_row = connection.execute(
+            "SELECT COUNT(*) AS amount FROM activity_check_members "
+            "WHERE check_id = ? AND status = 'excused'",
+            (check_id,),
+        ).fetchone()
+    punishment = punishment_override or check["punishment"]
+    punished = 0
+    excused = 0 if excused_row is None else int(excused_row["amount"])
+    failed = 0
+    for participant in participants:
+        try:
+            member = guild.get_member(participant["member_id"])
+            if member is None:
+                member = await guild.fetch_member(participant["member_id"])
+        except discord.NotFound:
+            with database_connection() as connection:
+                connection.execute(
+                    "UPDATE activity_check_members SET status = 'unavailable' "
+                    "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                    (check_id, participant["member_id"]),
+                )
+            continue
+        except DISCORD_REQUEST_ERRORS as error:
+            print(
+                f"Could not load member {participant['member_id']} for activity "
+                f"check #{check_id}: {error}"
+            )
+            with database_connection() as connection:
+                connection.execute(
+                    "UPDATE activity_check_members SET status = 'failed' "
+                    "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                    (check_id, participant["member_id"]),
+                )
+            failed += 1
+            continue
+
+        if any(role.id == ACTIVITY_CHECK_EXEMPT_ROLE_ID for role in member.roles):
+            with database_connection() as connection:
+                connection.execute(
+                    "UPDATE activity_check_members SET status = 'excused' "
+                    "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                    (check_id, member.id),
+                )
+            excused += 1
+            continue
+
+        case_id, error_message = await issue_activity_check_punishment(
+            guild,
+            member,
+            punishment,
+            check_id,
+            check["started_by"],
+        )
+        if error_message:
+            print(
+                f"Could not punish member {member.id} for activity check "
+                f"#{check_id}: {error_message}"
+            )
+            with database_connection() as connection:
+                connection.execute(
+                    "UPDATE activity_check_members SET status = 'failed' "
+                    "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                    (check_id, member.id),
+                )
+            failed += 1
+            continue
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE activity_check_members SET status = 'punished', case_id = ? "
+                "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+                (case_id, check_id, member.id),
+            )
+        punished += 1
+
+    status = "completed_with_errors" if failed else "completed"
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE activity_checks SET status = ? WHERE check_id = ? AND status = 'processing'",
+            (status, check_id),
+        )
+    if isinstance(channel, (discord.TextChannel, discord.Thread)) and check["message_id"]:
+        try:
+            message = await channel.fetch_message(check["message_id"])
+            await message.edit(
+                content=(
+                    f"Activity check #{check_id} ended. "
+                    f"{punished} punished · {excused} excused · {failed} failed."
+                ),
+                view=None,
+            )
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not update activity check message #{check_id}: {error}")
+    return punished, excused, failed
+
+
+class ActivityCheckView(discord.ui.View):
+    def __init__(self, check_id: int, started_by: int) -> None:
+        super().__init__(timeout=None)
+        self.check_id = check_id
+        self.started_by = started_by
+
+    @discord.ui.button(
+        label="End Early and Infract Now",
+        style=discord.ButtonStyle.danger,
+        custom_id="staff_activity_check:end_early",
+    )
+    async def end_early(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        actor = interaction.user
+        if guild is None or not isinstance(actor, discord.Member):
+            await respond_privately(interaction, "This button can only be used in the server.")
+            return
+        if actor.id != self.started_by and not any(
+            role.id in BOD_REVIEWER_ROLE_IDS for role in actor.roles
+        ):
+            await respond_privately(
+                interaction,
+                "Only the person who started this check or Board of Directors and higher may end it early.",
+            )
+            return
+        if _button.disabled:
+            await respond_privately(interaction, "This activity check is already ending.")
+            return
+        _button.disabled = True
+        await interaction.response.defer(ephemeral=True)
+        punished, excused, failed = await process_activity_check(
+            self.check_id,
+            guild,
+            punishment_override="Infraction",
+        )
+        await respond_privately(
+            interaction,
+            f"Activity check ended early: {punished} punished, {excused} excused, "
+            f"{failed} failed. The early-end button always issues an Infraction.",
+        )
+
+
 def get_guild_id() -> int | None:
     """Return the optional development guild ID, rejecting invalid values."""
     raw_guild_id = os.getenv("DISCORD_GUILD_ID")
@@ -2183,6 +2615,14 @@ class TestBot(commands.Bot):
                 message_id=action["message_id"],
             )
         self.add_view(StaffInformationView())
+        for activity_check in get_active_activity_checks():
+            self.add_view(
+                ActivityCheckView(
+                    activity_check["check_id"],
+                    activity_check["started_by"],
+                ),
+                message_id=activity_check["message_id"],
+            )
 
         guild_id = get_guild_id()
 
@@ -2207,9 +2647,12 @@ class TestBot(commands.Bot):
         print(f"Synced {len(synced)} global command(s).")
 
 
+bot_intents = discord.Intents.default()
+bot_intents.members = True
+
 bot = TestBot(
     command_prefix=commands.when_mentioned,
-    intents=discord.Intents.default(),
+    intents=bot_intents,
 )
 
 
@@ -2223,12 +2666,37 @@ async def on_ready() -> None:
         expire_strike_terminations.start()
     if not expire_ztp_records.is_running():
         expire_ztp_records.start()
+    if not expire_activity_checks.is_running():
+        expire_activity_checks.start()
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if payload.guild_id is None or payload.user_id == (bot.user.id if bot.user else None):
+        return
+    if str(payload.emoji) != "🟢":
+        return
+    check = get_activity_check_by_message(payload.message_id)
+    if (
+        check is None
+        or check["guild_id"] != payload.guild_id
+        or check["status"] != "active"
+        or datetime.fromisoformat(check["ends_at"])
+        <= (datetime.now(EASTERN_TIME) if EASTERN_TIME else datetime.now().astimezone())
+    ):
+        return
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE activity_check_members SET status = 'responded' "
+            "WHERE check_id = ? AND member_id = ? AND status = 'pending'",
+            (check["check_id"], payload.user_id),
+        )
 
 
 async def terminate_for_ztp(
     guild: discord.Guild,
     member: discord.Member,
-    issuer: discord.Member | discord.User,
+    issuer: discord.Member | discord.User | str,
     ztp_case: sqlite3.Row,
     triggering_case_id: int,
 ) -> str | None:
@@ -2861,6 +3329,216 @@ async def expire_ztp_records() -> None:
         log_error = await send_ztp_log(guild, embed)
         if log_error:
             print(f"Could not log ZTP expiry {format_ztp_id(case['ztp_id'])}: {log_error}")
+
+
+@tasks.loop(minutes=1)
+async def expire_activity_checks() -> None:
+    initialize_database()
+    now = datetime.now(EASTERN_TIME) if EASTERN_TIME else datetime.now().astimezone()
+    with database_connection() as connection:
+        checks = connection.execute(
+            "SELECT check_id, guild_id, ends_at FROM activity_checks "
+            "WHERE status = 'active'"
+        ).fetchall()
+    for check in checks:
+        if datetime.fromisoformat(check["ends_at"]) > now:
+            continue
+        guild = bot.get_guild(check["guild_id"])
+        if guild is None:
+            print(
+                f"Cannot finish activity check #{check['check_id']}: "
+                f"guild {check['guild_id']} is unavailable."
+            )
+            continue
+        await process_activity_check(check["check_id"], guild)
+
+
+@bot.tree.command(
+    name="activity-check",
+    description="Start a timed staff activity check.",
+)
+@app_commands.guild_only()
+@app_commands.check(staff_only)
+@app_commands.choices(
+    punishment=[
+        app_commands.Choice(name="Infraction", value="Infraction"),
+        app_commands.Choice(name="Strike", value="Strike"),
+        app_commands.Choice(name="Termination", value="Termination"),
+        app_commands.Choice(name="Warning", value="Warning"),
+    ],
+)
+@app_commands.describe(
+    duration_minutes="How long staff have to react, in minutes",
+    punishment="Punishment for eligible staff who do not react in time",
+)
+async def activity_check(
+    interaction: discord.Interaction,
+    duration_minutes: app_commands.Range[int, 1, 10080],
+    punishment: app_commands.Choice[str],
+) -> None:
+    guild = interaction.guild
+    issuer = interaction.user
+    channel = interaction.channel
+    if (
+        guild is None
+        or not isinstance(issuer, discord.Member)
+        or not isinstance(channel, (discord.TextChannel, discord.Thread))
+    ):
+        await respond_privately(interaction, "This command must be used in a server text channel.")
+        return
+    if not PUNISHMENT_BANNER_PATH.is_file():
+        await respond_privately(
+            interaction,
+            "The punishment banner is missing. Restore "
+            "`assets/staff_discipline_banner.png` and try again.",
+        )
+        return
+    bot_member = guild.me
+    if bot_member is None:
+        await respond_privately(interaction, "I could not verify my server permissions.")
+        return
+    channel_permissions = channel.permissions_for(bot_member)
+    if not (
+        channel_permissions.send_messages
+        and channel_permissions.embed_links
+        and channel_permissions.add_reactions
+        and channel_permissions.read_message_history
+    ):
+        await respond_privately(
+            interaction,
+            "I need Send Messages, Embed Links, Add Reactions, and Read Message History permissions in this channel.",
+        )
+        return
+    if not bot.intents.members:
+        await respond_privately(
+            interaction,
+            "The bot needs the Server Members intent enabled to identify all staff for an activity check.",
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    participants: list[discord.Member] = []
+    try:
+        async for candidate in guild.fetch_members(limit=None):
+            if any(role.id in STAFF_ROLE_ID_SET for role in candidate.roles):
+                participants.append(candidate)
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not load staff members for activity check: {error}")
+        await respond_privately(
+            interaction,
+            "I could not retrieve the server member list. Confirm the privileged Server Members intent is enabled in the Discord Developer Portal.",
+        )
+        return
+    if not participants:
+        await respond_privately(interaction, "There are no staff members to include in this activity check.")
+        return
+
+    now = datetime.now(EASTERN_TIME) if EASTERN_TIME else datetime.now().astimezone()
+    ends_at = now + timedelta(minutes=duration_minutes)
+    created_at, _ = eastern_timestamp()
+    initialize_database()
+    with database_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO activity_checks "
+            "(guild_id, channel_id, started_by, punishment, ends_at, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                guild.id,
+                channel.id,
+                issuer.id,
+                punishment.value,
+                ends_at.isoformat(),
+                created_at,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("Could not create the activity check record.")
+        check_id = cursor.lastrowid
+        connection.executemany(
+            "INSERT INTO activity_check_members (check_id, member_id, status) "
+            "VALUES (?, ?, ?)",
+            [
+                (
+                    check_id,
+                    participant.id,
+                    "excused"
+                    if any(
+                        role.id == ACTIVITY_CHECK_EXEMPT_ROLE_ID
+                        for role in participant.roles
+                    )
+                    else "pending",
+                )
+                for participant in participants
+            ],
+        )
+
+    embed = discord.Embed(
+        title="📋 Staff Activity Check",
+        description=(
+            "All staff members are required to complete the weekly staff activity check. "
+            "To submit your activity check,\n"
+            "> 🟢 **React to the message below to not get punished (LOA Exscused)**\n"
+            "Please make sure you complete the activity check when required. Failure to "
+            "submit may result in your activity not being recorded."
+        ),
+        color=discord.Color.from_rgb(54, 57, 63),
+        timestamp=now,
+    )
+    embed.add_field(
+        name="Time Limit",
+        value=f"{duration_minutes} minute(s) · Ends <t:{int(ends_at.timestamp())}:F>",
+        inline=False,
+    )
+    embed.add_field(name="Selected Punishment", value=punishment.value, inline=False)
+    try:
+        message = await channel.send(
+            embed=embed,
+            view=ActivityCheckView(check_id, issuer.id),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not send activity check #{check_id}: {error}")
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE activity_checks SET status = 'failed' WHERE check_id = ?",
+                (check_id,),
+            )
+        await respond_privately(interaction, "I could not send the activity check message.")
+        return
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE activity_checks SET message_id = ?, status = 'active' "
+            "WHERE check_id = ? AND status = 'pending'",
+            (message.id, check_id),
+        )
+    try:
+        await message.add_reaction("🟢")
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not add the reaction to activity check #{check_id}: {error}")
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE activity_checks SET status = 'failed' WHERE check_id = ?",
+                (check_id,),
+            )
+        try:
+            await message.edit(
+                content="This activity check failed to start because the bot could not add its reaction.",
+                view=None,
+            )
+        except DISCORD_REQUEST_ERRORS as edit_error:
+            print(f"Could not mark failed activity check #{check_id}: {edit_error}")
+        await respond_privately(
+            interaction,
+            "The activity check was posted, but I could not add the required green reaction. "
+            "Check my Add Reactions permission; no punishments will be issued from this check.",
+        )
+        return
+    await respond_privately(
+        interaction,
+        f"Activity check #{check_id} is live for {duration_minutes} minute(s), "
+        f"with {len(participants)} staff member(s) included. "
+        f"Non-responders will receive {punishment.value}.",
+    )
 
 
 @bot.tree.command(
@@ -4356,7 +5034,7 @@ async def discipline_appeal(
     if case["member_id"] != appellant.id:
         await respond_privately(interaction, "The appellant must be the member named in that case.")
         return
-    if case["punishment"] == "Warning":
+    if case["punishment"] == "Warning" and case["activity_check_id"] is None:
         await respond_privately(interaction, "Warnings are unappealable.")
         return
     if case["status"] != "active":
