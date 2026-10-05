@@ -2524,33 +2524,92 @@ async def process_activity_check(
     if isinstance(channel, (discord.TextChannel, discord.Thread)) and check["message_id"]:
         try:
             message = await channel.fetch_message(check["message_id"])
-            await message.edit(
-                content=(
-                    f"Activity check #{check_id} ended. "
-                    f"{punished} punished · {excused} excused · {failed} failed."
+            banner_url = next(
+                (
+                    attachment.url
+                    for attachment in message.attachments
+                    if attachment.filename == ACTIVITY_CHECK_BANNER_FILENAME
                 ),
-                view=None,
+                None,
+            )
+            if banner_url is None:
+                print(f"Activity check #{check_id} has no attached banner to preserve.")
+            await message.edit(
+                content=None,
+                embeds=[],
+                attachments=message.attachments,
+                view=build_activity_check_layout(
+                    f"Activity check #{check_id} ended. "
+                    f"{punished} punished · {excused} excused · {failed} failed.",
+                    banner_url,
+                ),
             )
         except DISCORD_REQUEST_ERRORS as error:
             print(f"Could not update activity check message #{check_id}: {error}")
     return punished, excused, failed
 
 
-class ActivityCheckView(discord.ui.View):
-    def __init__(self, check_id: int, started_by: int) -> None:
+def build_activity_check_container(
+    details: str,
+    banner_url: str | None,
+    button: discord.ui.Button | None = None,
+) -> discord.ui.Container:
+    container = discord.ui.Container(accent_color=discord.Color.from_rgb(54, 57, 63))
+    if banner_url is not None:
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(
+            media=banner_url,
+            description="Arkansas State Roleplay Staff Activity Check",
+        )
+        container.add_item(gallery)
+        container.add_item(
+            discord.ui.Separator(
+                visible=True,
+                spacing=discord.SeparatorSpacing.small,
+            )
+        )
+    container.add_item(discord.ui.TextDisplay(details))
+    if button is not None:
+        container.add_item(discord.ui.ActionRow(button))
+    return container
+
+
+def build_activity_check_layout(
+    details: str,
+    banner_url: str | None,
+) -> discord.ui.LayoutView:
+    layout = discord.ui.LayoutView(timeout=None)
+    layout.add_item(build_activity_check_container(details, banner_url))
+    return layout
+
+
+class ActivityCheckView(discord.ui.LayoutView):
+    def __init__(
+        self,
+        check_id: int,
+        started_by: int,
+        details: str = "# Staff Activity Check",
+    ) -> None:
         super().__init__(timeout=None)
         self.check_id = check_id
         self.started_by = started_by
+        button = discord.ui.Button(
+            label="End Early and Infract Now",
+            style=discord.ButtonStyle.danger,
+            custom_id="staff_activity_check:end_early",
+        )
+        button.callback = self.end_early
+        self.add_item(
+            build_activity_check_container(
+                details,
+                f"attachment://{ACTIVITY_CHECK_BANNER_FILENAME}",
+                button,
+            )
+        )
 
-    @discord.ui.button(
-        label="End Early and Infract Now",
-        style=discord.ButtonStyle.danger,
-        custom_id="staff_activity_check:end_early",
-    )
     async def end_early(
         self,
         interaction: discord.Interaction,
-        _button: discord.ui.Button,
     ) -> None:
         guild = interaction.guild
         actor = interaction.user
@@ -2565,10 +2624,15 @@ class ActivityCheckView(discord.ui.View):
                 "Only the person who started this check or Board of Directors and higher may end it early.",
             )
             return
-        if _button.disabled:
+        if not any(
+            isinstance(item, discord.ui.Button) and not item.disabled
+            for item in self.walk_children()
+        ):
             await respond_privately(interaction, "This activity check is already ending.")
             return
-        _button.disabled = True
+        for item in self.walk_children():
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
         await interaction.response.defer(ephemeral=True)
         punished, excused, failed = await process_activity_check(
             self.check_id,
@@ -3474,35 +3538,26 @@ async def activity_check(
             ],
         )
 
-    embed = discord.Embed(
-        title="📋 Staff Activity Check",
-        description=(
-            "All staff members are required to complete the weekly staff activity check. "
-            "To submit your activity check,\n"
-            "> 🟢 **React to the message below to not get punished (LOA Exscused)**\n"
-            "Please make sure you complete the activity check when required. Failure to "
-            "submit may result in your activity not being recorded."
-        ),
-        color=discord.Color.from_rgb(54, 57, 63),
-        timestamp=now,
+    activity_check_details = (
+        "# Staff Activity Check\n"
+        "All staff members are required to complete the weekly staff activity check. "
+        "To submit your activity check,\n"
+        "> 🟢 **React to the message below to not get punished (LOA Exscused)**\n"
+        "Please make sure you complete the activity check when required. Failure to "
+        "submit may result in your activity not being recorded.\n\n"
+        f"**Time Limit:** {duration_minutes} minute(s) · "
+        f"Ends <t:{int(ends_at.timestamp())}:F>\n"
+        f"**Selected Punishment:** {punishment.value}"
     )
-    embed.set_image(url=f"attachment://{ACTIVITY_CHECK_BANNER_FILENAME}")
-    embed.add_field(
-        name="Time Limit",
-        value=f"{duration_minutes} minute(s) · Ends <t:{int(ends_at.timestamp())}:F>",
-        inline=False,
-    )
-    embed.add_field(name="Selected Punishment", value=punishment.value, inline=False)
     try:
         message = await channel.send(
-            embed=embed,
             files=[
                 discord.File(
                     ACTIVITY_CHECK_BANNER_PATH,
                     filename=ACTIVITY_CHECK_BANNER_FILENAME,
                 )
             ],
-            view=ActivityCheckView(check_id, issuer.id),
+            view=ActivityCheckView(check_id, issuer.id, activity_check_details),
             allowed_mentions=discord.AllowedMentions.none(),
         )
     except DISCORD_REQUEST_ERRORS as error:
@@ -3529,10 +3584,25 @@ async def activity_check(
                 "UPDATE activity_checks SET status = 'failed' WHERE check_id = ?",
                 (check_id,),
             )
+        banner_url = next(
+            (
+                attachment.url
+                for attachment in message.attachments
+                if attachment.filename == ACTIVITY_CHECK_BANNER_FILENAME
+            ),
+            None,
+        )
+        if banner_url is None:
+            print(f"Failed activity check #{check_id} has no attached banner to preserve.")
         try:
             await message.edit(
-                content="This activity check failed to start because the bot could not add its reaction.",
-                view=None,
+                content=None,
+                embeds=[],
+                attachments=message.attachments,
+                view=build_activity_check_layout(
+                    "This activity check failed to start because the bot could not add its reaction.",
+                    banner_url,
+                ),
             )
         except DISCORD_REQUEST_ERRORS as edit_error:
             print(f"Could not mark failed activity check #{check_id}: {edit_error}")
