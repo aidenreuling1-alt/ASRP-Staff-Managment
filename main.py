@@ -19,6 +19,7 @@ from discord.ext import commands, tasks
 PUNISHMENT_CHANNEL_ID = 1513827137109360712
 PROMOTION_CHANNEL_ID = 1513157154474033269
 ZTP_LOG_CHANNEL_ID = 1556373690248339497
+WELCOME_CHANNEL_ID = 1513157148404744197
 UNDER_INVESTIGATION_ROLE_ID = 1517412418915930184
 SUSPENDED_STAFF_ROLE_ID = 1514587990289158184
 RETIRED_STAFF_ROLE_ID = 1513157147578597500
@@ -1680,6 +1681,53 @@ def build_staff_information_embed() -> discord.Embed:
     )
 
 
+def build_welcome_embed(member: discord.Member) -> discord.Embed:
+    guild = member.guild
+    resource_channels = (
+        ("📜", "Server Rules", "ingame-rules", "・📋・ingame-rules"),
+        ("🎮", "How to Join the Game", "sessions", "・🎮・sessions"),
+        ("💬", "Community Discord Guide", "discord-rules", "・📋・discord-rules"),
+        ("📷", "Server Highlights", "media", "├・📸・media"),
+    )
+    resource_lines = []
+    for emoji, title, slug, fallback_name in resource_channels:
+        channel = next(
+            (
+                candidate
+                for candidate in guild.text_channels
+                if candidate.name.endswith(slug)
+            ),
+            None,
+        )
+        channel_reference = channel.mention if channel is not None else f"`{fallback_name}`"
+        resource_lines.append(f"{emoji} **{title}** — {channel_reference}")
+
+    embed = discord.Embed(
+        title="Welcome to Arkansas State Roleplay!",
+        description=(
+            f"We're glad to have you here, {member.mention}. Whether you're here to "
+            "roleplay, patrol the streets, or just hang out with the community, "
+            "you're in the right place."
+        ),
+        color=discord.Color.from_rgb(54, 57, 63),
+    )
+    embed.add_field(
+        name="Here's what to check out first:",
+        value="\n".join(resource_lines),
+        inline=False,
+    )
+    embed.add_field(
+        name="Need help?",
+        value=(
+            "If you have any questions, feel free to reach out to staff. "
+            "Enjoy your stay, and we'll see you on the streets!"
+        ),
+        inline=False,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    return embed
+
+
 def get_case_action(case_id: int) -> sqlite3.Row | None:
     initialize_database()
     with database_connection() as connection:
@@ -2898,6 +2946,48 @@ async def on_ready() -> None:
         expire_ztp_records.start()
     if not expire_activity_checks.is_running():
         expire_activity_checks.start()
+
+
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    guild = member.guild
+    channel = guild.get_channel(WELCOME_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(WELCOME_CHANNEL_ID)
+        except DISCORD_REQUEST_ERRORS as error:
+            print(
+                f"Could not load welcome channel {WELCOME_CHANNEL_ID} "
+                f"for guild {guild.id}: {error}"
+            )
+            return
+
+    if not isinstance(channel, discord.TextChannel):
+        print(
+            f"Welcome channel {WELCOME_CHANNEL_ID} in guild {guild.id} "
+            "is missing or is not a text channel."
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None:
+        print(f"Could not send welcome for member {member.id}: bot member is unavailable.")
+        return
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.send_messages or not permissions.embed_links:
+        print(
+            f"Could not send welcome for member {member.id}: the bot needs "
+            f"Send Messages and Embed Links in channel {WELCOME_CHANNEL_ID}."
+        )
+        return
+
+    try:
+        await channel.send(
+            embed=build_welcome_embed(member),
+            allowed_mentions=discord.AllowedMentions(users=[member]),
+        )
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not post a welcome for member {member.id}: {error}")
 
 
 @bot.event
