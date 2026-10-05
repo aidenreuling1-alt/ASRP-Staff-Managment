@@ -38,6 +38,8 @@ PROMOTION_BANNER_PATH = Path(__file__).parent / "assets" / "staff_promotion_bann
 PROMOTION_BANNER_FILENAME = "staff_promotion_banner.png"
 RETIREMENT_BANNER_PATH = Path(__file__).parent / "assets" / "staff_retirement_banner.png"
 RETIREMENT_BANNER_FILENAME = "staff_retirement_banner.png"
+ACTIVITY_CHECK_BANNER_PATH = Path(__file__).parent / "assets" / "staff_activity_check_banner.png"
+ACTIVITY_CHECK_BANNER_FILENAME = "staff_activity_check_banner.png"
 MAX_REINSTATEMENTS = 2
 try:
     EASTERN_TIME = ZoneInfo("America/New_York")
@@ -3386,11 +3388,11 @@ async def activity_check(
     ):
         await respond_privately(interaction, "This command must be used in a server text channel.")
         return
-    if not PUNISHMENT_BANNER_PATH.is_file():
+    if not ACTIVITY_CHECK_BANNER_PATH.is_file():
         await respond_privately(
             interaction,
-            "The punishment banner is missing. Restore "
-            "`assets/staff_discipline_banner.png` and try again.",
+            "The activity check banner is missing. Restore "
+            "`assets/staff_activity_check_banner.png` and try again.",
         )
         return
     bot_member = guild.me
@@ -3484,6 +3486,7 @@ async def activity_check(
         color=discord.Color.from_rgb(54, 57, 63),
         timestamp=now,
     )
+    embed.set_image(url=f"attachment://{ACTIVITY_CHECK_BANNER_FILENAME}")
     embed.add_field(
         name="Time Limit",
         value=f"{duration_minutes} minute(s) · Ends <t:{int(ends_at.timestamp())}:F>",
@@ -3493,6 +3496,12 @@ async def activity_check(
     try:
         message = await channel.send(
             embed=embed,
+            files=[
+                discord.File(
+                    ACTIVITY_CHECK_BANNER_PATH,
+                    filename=ACTIVITY_CHECK_BANNER_FILENAME,
+                )
+            ],
             view=ActivityCheckView(check_id, issuer.id),
             allowed_mentions=discord.AllowedMentions.none(),
         )
