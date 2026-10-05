@@ -31,7 +31,21 @@ PUNISHMENT_ROLE_IDS: dict[str, tuple[int, int, int]] = {
 PUNISHMENT_ROLE_ID_SET = {
     role_id for role_ids in PUNISHMENT_ROLE_IDS.values() for role_id in role_ids
 }
-CASE_DATABASE_PATH = Path(__file__).with_name("staff_cases.sqlite3")
+
+
+def get_case_database_path() -> Path:
+    configured_path = os.getenv("STAFF_DATABASE_PATH")
+    if configured_path:
+        return Path(configured_path).expanduser()
+
+    railway_volume_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if railway_volume_path:
+        return Path(railway_volume_path) / "staff_cases.sqlite3"
+
+    return Path(__file__).with_name("staff_cases.sqlite3")
+
+
+CASE_DATABASE_PATH = get_case_database_path()
 PUNISHMENT_BANNER_PATH = Path(__file__).parent / "assets" / "staff_discipline_banner.png"
 PUNISHMENT_BANNER_FILENAME = "staff_discipline_banner.png"
 PROMOTION_BANNER_PATH = Path(__file__).parent / "assets" / "staff_promotion_banner.png"
@@ -164,7 +178,8 @@ DISCORD_REQUEST_ERRORS = (
 
 @contextmanager
 def database_connection() -> Generator[sqlite3.Connection, None, None]:
-    connection = sqlite3.connect(CASE_DATABASE_PATH)
+    CASE_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(CASE_DATABASE_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
     try:
         yield connection
@@ -289,6 +304,26 @@ def initialize_database() -> None:
         )
 
 
+def migrate_legacy_database_to_volume() -> None:
+    legacy_path = Path(__file__).with_name("staff_cases.sqlite3")
+    if (
+        CASE_DATABASE_PATH.resolve() == legacy_path.resolve()
+        or CASE_DATABASE_PATH.exists()
+        or not legacy_path.is_file()
+    ):
+        return
+
+    CASE_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(legacy_path)
+    destination = sqlite3.connect(CASE_DATABASE_PATH)
+    try:
+        source.backup(destination)
+    finally:
+        source.close()
+        destination.close()
+    print(f"Migrated existing case history to persistent database {CASE_DATABASE_PATH}.")
+
+
 def create_case_id() -> int:
     """Create a persistent case row and return its sequential case number."""
     initialize_database()
@@ -378,9 +413,11 @@ def get_punishment_role_plan(
     counts: dict[str, int],
 ) -> tuple[list[discord.Role], list[discord.Role]] | str:
     target_role_ids = {
-        role_ids[min(max(counts.get(punishment, 0), 0), len(role_ids)) - 1]
+        role_id
         for punishment, role_ids in PUNISHMENT_ROLE_IDS.items()
-        if counts.get(punishment, 0) > 0
+        for role_id in role_ids[
+            : min(max(counts.get(punishment, 0), 0), len(role_ids))
+        ]
     }
     current_role_ids = {
         role.id for role in member.roles if role.id in PUNISHMENT_ROLE_ID_SET
@@ -2744,30 +2781,20 @@ class ActivityCheckView(discord.ui.LayoutView):
         )
 
 
-def get_guild_id() -> int | None:
-    """Return the optional development guild ID, rejecting invalid values."""
-    raw_guild_id = os.getenv("DISCORD_GUILD_ID")
-    if raw_guild_id is None:
-        return None
-
-    raw_guild_id = raw_guild_id.strip()
-    if not raw_guild_id:
-        return None
-
-    try:
-        guild_id = int(raw_guild_id)
-    except (TypeError, ValueError) as error:
-        raise ValueError("DISCORD_GUILD_ID must be a numeric Discord server ID.") from error
-
-    if guild_id <= 0:
-        raise ValueError("DISCORD_GUILD_ID must be a positive Discord server ID.")
-
-    return guild_id
-
-
 class TestBot(commands.Bot):
     async def setup_hook(self) -> None:
+        if (
+            (os.getenv("RAILWAY_SERVICE_ID") or os.getenv("RAILWAY_PROJECT_ID"))
+            and not os.getenv("STAFF_DATABASE_PATH")
+            and not os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+        ):
+            raise RuntimeError(
+                "Railway case history requires a mounted volume. Mount one and set "
+                "STAFF_DATABASE_PATH=/data/staff_cases.sqlite3."
+            )
+        migrate_legacy_database_to_volume()
         initialize_database()
+        print(f"Using case database: {CASE_DATABASE_PATH}")
         recover_interrupted_activity_checks()
         for action in get_pending_actions():
             action_type = action["action_type"]
@@ -2789,27 +2816,25 @@ class TestBot(commands.Bot):
                 message_id=activity_check["message_id"],
             )
 
-        guild_id = get_guild_id()
-
-        scopes: list[discord.Object | None] = [None]
-        if guild_id is not None:
-            scopes.append(discord.Object(id=guild_id))
-
-        for guild in scopes:
-            registered = await self.tree.fetch_commands(guild=guild)
-            for command in registered:
-                if command.name == "ping":
-                    await command.delete()
-
-        if guild_id is not None:
-            guild = discord.Object(id=guild_id)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} command(s) to development server {guild_id}.")
-            return
-
         synced = await self.tree.sync()
         print(f"Synced {len(synced)} global command(s).")
+        async for guild in self.fetch_guilds(limit=None):
+            guild_scope = discord.Object(id=guild.id)
+            try:
+                registered = await self.tree.fetch_commands(guild=guild_scope)
+                if not registered:
+                    continue
+                self.tree.clear_commands(guild=guild_scope)
+                await self.tree.sync(guild=guild_scope)
+                print(
+                    f"Removed {len(registered)} obsolete guild-scoped command(s) "
+                    f"from server {guild.id}."
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"Could not remove duplicate guild-scoped commands from "
+                    f"server {guild.id}: {error}"
+                )
 
 
 bot_intents = discord.Intents.default()
@@ -2821,10 +2846,50 @@ bot = TestBot(
 )
 
 
+@tasks.loop(count=1)
+async def reconcile_active_punishment_roles() -> None:
+    initialize_database()
+    with database_connection() as connection:
+        active_members = connection.execute(
+            "SELECT DISTINCT guild_id, member_id FROM punishment_cases "
+            "WHERE status = 'active' "
+            "AND punishment IN ('Warning', 'Infraction', 'Strike')"
+        ).fetchall()
+
+    for row in active_members:
+        guild = bot.get_guild(row["guild_id"])
+        if guild is None:
+            print(
+                f"Cannot sync punishment roles for member {row['member_id']}: "
+                f"guild {row['guild_id']} is unavailable."
+            )
+            continue
+        member = guild.get_member(row["member_id"])
+        if member is None:
+            try:
+                member = await guild.fetch_member(row["member_id"])
+            except discord.NotFound:
+                continue
+            except DISCORD_REQUEST_ERRORS as error:
+                print(
+                    f"Could not load member {row['member_id']} to sync "
+                    f"punishment roles: {error}"
+                )
+                continue
+        sync_error = await sync_punishment_roles(guild, member)
+        if sync_error:
+            print(
+                f"Could not restore punishment roles for member {member.id}: "
+                f"{sync_error}"
+            )
+
+
 @bot.event
 async def on_ready() -> None:
     if bot.user is not None:
         print(f"Bot is online as {bot.user} (ID: {bot.user.id}).")
+    if not reconcile_active_punishment_roles.is_running():
+        reconcile_active_punishment_roles.start()
     if not expire_staff_suspensions.is_running():
         expire_staff_suspensions.start()
     if not expire_strike_terminations.is_running():
