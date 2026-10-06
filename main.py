@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 PUNISHMENT_CHANNEL_ID = 1513827137109360712
+PUNISHMENT_REVIEW_CHANNEL_ID = 1557128893796716624
 PROMOTION_CHANNEL_ID = 1513157154474033269
 ZTP_LOG_CHANNEL_ID = 1556373690248339497
 WELCOME_CHANNEL_ID = 1513157148404744197
@@ -219,6 +220,14 @@ def initialize_database() -> None:
             "demotion_added_role_ids": "TEXT",
             "termination_due_at": "TEXT",
             "activity_check_id": "INTEGER",
+            "review_tier": "TEXT",
+            "review_message_id": "INTEGER",
+            "review_add_role_ids": "TEXT",
+            "review_remove_role_ids": "TEXT",
+            "review_converted_case_ids": "TEXT",
+            "review_proof": "TEXT",
+            "review_issuer_id": "INTEGER",
+            "review_reconcile_on_deny": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, definition in columns.items():
             if name not in existing_columns:
@@ -646,6 +655,17 @@ def can_review_appeal(member: discord.Member, appealable_by: str | None) -> bool
     if appealable_by == "BoD+":
         return bool(role_ids & BOD_REVIEWER_ROLE_IDS)
     return bool(role_ids & OWNERSHIP_ROLE_IDS)
+
+
+def can_review_punishment(member: discord.Member, tier: str) -> bool:
+    role_ids = {role.id for role in member.roles}
+    if tier == "IA":
+        return bool(role_ids & {STAFF_ROLE_IDS["HR"], STAFF_ROLE_IDS["SHR"]})
+    if tier == "Management":
+        return STAFF_ROLE_IDS["SHR"] in role_ids
+    if tier == "BoD+":
+        return bool(role_ids & BOD_REVIEWER_ROLE_IDS)
+    return False
 
 
 def get_case_role_ids(case: sqlite3.Row) -> list[int]:
@@ -1150,6 +1170,16 @@ def get_pending_actions() -> list[sqlite3.Row]:
     return rows
 
 
+def get_pending_punishment_reviews() -> list[sqlite3.Row]:
+    initialize_database()
+    with database_connection() as connection:
+        rows = connection.execute(
+            "SELECT case_id, review_tier, review_message_id FROM punishment_cases "
+            "WHERE status = 'pending_review' AND review_message_id IS NOT NULL"
+        ).fetchall()
+    return rows
+
+
 async def fetch_case_message(
     guild: discord.Guild,
     case: sqlite3.Row,
@@ -1365,6 +1395,56 @@ class CaseActionView(discord.ui.View):
             interaction,
             f"Action for case #{case['case_id']} cancelled.{role_sync_warning}",
         )
+
+
+class PunishmentReviewView(discord.ui.View):
+    def __init__(self, case_id: int, tier: str) -> None:
+        super().__init__(timeout=None)
+        self.case_id = case_id
+        self.tier = tier
+        buttons = (
+            (
+                "Accept",
+                discord.ButtonStyle.success,
+                "accept",
+                False,
+            ),
+            (
+                "Deny",
+                discord.ButtonStyle.danger,
+                "deny",
+                False,
+            ),
+            (
+                "Escalate Higher",
+                discord.ButtonStyle.primary,
+                "escalate",
+                tier == "BoD+",
+            ),
+        )
+        for label, style, action, disabled in buttons:
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"punishment-review:{case_id}:{action}",
+                disabled=disabled,
+            )
+            if action == "accept":
+                button.callback = self.accept
+            elif action == "deny":
+                button.callback = self.deny
+            else:
+                button.callback = self.escalate
+            self.add_item(button)
+
+    async def accept(self, interaction: discord.Interaction) -> None:
+        await handle_punishment_review(interaction, self.case_id, "accept")
+
+    async def deny(self, interaction: discord.Interaction) -> None:
+        await handle_punishment_review(interaction, self.case_id, "deny")
+
+    async def escalate(self, interaction: discord.Interaction) -> None:
+        await handle_punishment_review(interaction, self.case_id, "escalate")
 
 
 class RevokeConfirmationView(discord.ui.View):
@@ -2854,6 +2934,12 @@ class TestBot(commands.Bot):
                 ),
                 message_id=action["message_id"],
             )
+        for review in get_pending_punishment_reviews():
+            if review["review_tier"] in {"IA", "Management", "BoD+"}:
+                self.add_view(
+                    PunishmentReviewView(review["case_id"], review["review_tier"]),
+                    message_id=review["review_message_id"],
+                )
         self.add_view(StaffInformationView())
         for activity_check in get_active_activity_checks():
             self.add_view(
@@ -4282,6 +4368,471 @@ async def cases_promotion(interaction: discord.Interaction, member: discord.Memb
 bot.tree.add_command(cases_group)
 
 
+def build_punishment_review_embed(
+    case: sqlite3.Row,
+    tier: str,
+) -> discord.Embed:
+    tier_name = {
+        "IA": "Internal Affairs Team",
+        "Management": "Management Team",
+        "BoD+": "BoD+",
+    }[tier]
+    embed = discord.Embed(
+        title=f"Punishment Review — Case #{case['case_id']}",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(EASTERN_TIME) if EASTERN_TIME else datetime.now().astimezone(),
+    )
+    embed.add_field(name="Staff member", value=f"<@{case['member_id']}>", inline=True)
+    embed.add_field(name="Punishment", value=case["punishment"] or "Unknown", inline=True)
+    embed.add_field(name="Review tier", value=tier_name, inline=True)
+    embed.add_field(
+        name="Reason",
+        value=(case["reason"] or "Not provided")[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="Proof / review note",
+        value=(case["review_proof"] or "Not provided")[:1024],
+        inline=False,
+    )
+    issuer_id = case["review_issuer_id"]
+    embed.set_footer(text=f"Requested by {f'<@{issuer_id}>' if issuer_id else 'Unknown'}")
+    return embed
+
+
+async def get_punishment_review_channel(
+    guild: discord.Guild,
+) -> discord.TextChannel | None:
+    channel = guild.get_channel(PUNISHMENT_REVIEW_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(PUNISHMENT_REVIEW_CHANNEL_ID)
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not load punishment review channel: {error}")
+            return None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def publish_punishment_review(
+    guild: discord.Guild,
+    case: sqlite3.Row,
+) -> tuple[discord.Message | None, str | None]:
+    tier = case["review_tier"]
+    if tier not in {"IA", "Management", "BoD+"}:
+        return None, "This case has no valid review tier."
+    channel = await get_punishment_review_channel(guild)
+    if channel is None:
+        return None, "The configured punishment review channel is unavailable."
+    bot_member = guild.me
+    if bot_member is None:
+        return None, "I could not verify my server permissions."
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.send_messages or not permissions.embed_links:
+        return None, "I need Send Messages and Embed Links permissions in the review channel."
+
+    review_view = PunishmentReviewView(case["case_id"], tier)
+    embed = build_punishment_review_embed(case, tier)
+    if case["review_message_id"] is not None:
+        try:
+            existing = await channel.fetch_message(case["review_message_id"])
+        except discord.NotFound:
+            existing = None
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not fetch review message for case #{case['case_id']}: {error}")
+            return None, "I could not load the existing review message."
+        if existing is not None:
+            try:
+                await existing.edit(embed=embed, view=review_view)
+            except DISCORD_REQUEST_ERRORS as error:
+                print(f"Could not update review message for case #{case['case_id']}: {error}")
+                return None, "I could not update the existing review message."
+            return existing, None
+
+    try:
+        message = await channel.send(
+            embed=embed,
+            view=review_view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not publish punishment review for case #{case['case_id']}: {error}")
+        return None, "I could not post the review in the configured review channel."
+    with database_connection() as connection:
+        updated = connection.execute(
+            "UPDATE punishment_cases SET review_message_id = ? "
+            "WHERE case_id = ? AND status = 'pending_review'",
+            (message.id, case["case_id"]),
+        )
+    if updated.rowcount != 1:
+        try:
+            await message.edit(view=None)
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not remove stale review controls for case #{case['case_id']}: {error}")
+        return None, "This case changed while the review message was being posted."
+    return message, None
+
+
+def get_review_role_plan(
+    guild: discord.Guild,
+    case: sqlite3.Row,
+) -> tuple[list[discord.Role], list[discord.Role]] | str:
+    try:
+        add_ids = json.loads(case["review_add_role_ids"] or "[]")
+        remove_ids = json.loads(case["review_remove_role_ids"] or "[]")
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError("This review has invalid saved role changes.") from error
+    if (
+        not isinstance(add_ids, list)
+        or not isinstance(remove_ids, list)
+        or any(not isinstance(role_id, int) for role_id in add_ids + remove_ids)
+    ):
+        raise ValueError("This review has invalid saved role changes.")
+    missing_ids = {role_id for role_id in add_ids + remove_ids if guild.get_role(role_id) is None}
+    if missing_ids:
+        return "A saved punishment role is missing from this server."
+    return (
+        [guild.get_role(role_id) for role_id in add_ids if guild.get_role(role_id) is not None],
+        [guild.get_role(role_id) for role_id in remove_ids if guild.get_role(role_id) is not None],
+    )
+
+
+async def finish_punishment_review(
+    interaction: discord.Interaction,
+    case_id: int,
+) -> None:
+    guild = interaction.guild
+    case = get_case(case_id)
+    if guild is None or case is None or case["guild_id"] != guild.id:
+        await respond_privately(interaction, "This case could not be found in this server.")
+        return
+    member = guild.get_member(case["member_id"])
+    if member is None:
+        try:
+            member = await guild.fetch_member(case["member_id"])
+        except discord.NotFound:
+            await respond_privately(interaction, "The staff member in this case is no longer in the server.")
+            return
+        except DISCORD_REQUEST_ERRORS as error:
+            await respond_privately(interaction, f"I could not load the staff member: {error}")
+            return
+
+    try:
+        role_plan = get_review_role_plan(guild, case)
+    except ValueError as error:
+        await respond_privately(interaction, str(error))
+        return
+    if isinstance(role_plan, str):
+        await respond_privately(interaction, role_plan)
+        return
+    roles_to_add, roles_to_remove = role_plan
+    bot_member = guild.me
+    if (
+        bot_member is None
+        or not bot_member.guild_permissions.manage_roles
+        or member.id == guild.owner_id
+        or member.top_role >= bot_member.top_role
+        or any(role >= bot_member.top_role for role in roles_to_add + roles_to_remove)
+    ):
+        await respond_privately(
+            interaction,
+            "The bot's permissions or role hierarchy prevents applying this punishment.",
+        )
+        return
+
+    original_roles = list(member.roles)
+    with database_connection() as connection:
+        updated = connection.execute(
+            "UPDATE punishment_cases SET status = 'processing' "
+            "WHERE case_id = ? AND status = 'pending_review'",
+            (case_id,),
+        )
+    if updated.rowcount != 1:
+        await respond_privately(interaction, "This case has already been decided.")
+        return
+
+    remove_ids = {role.id for role in roles_to_remove}
+    updated_roles = [role for role in original_roles if role.id not in remove_ids]
+    updated_roles.extend(role for role in roles_to_add if role not in updated_roles)
+    try:
+        await member.edit(roles=updated_roles, reason=f"Approved punishment case #{case_id}")
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not apply approved punishment case #{case_id}: {error}")
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE punishment_cases SET status = 'pending_review' "
+                "WHERE case_id = ? AND status = 'processing'",
+                (case_id,),
+            )
+        await respond_privately(
+            interaction,
+            "Discord could not apply the role changes. The case remains pending review.",
+        )
+        return
+
+    log_channel = guild.get_channel(PUNISHMENT_CHANNEL_ID)
+    if log_channel is None:
+        try:
+            log_channel = await guild.fetch_channel(PUNISHMENT_CHANNEL_ID)
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not load punishment log channel for case #{case_id}: {error}")
+            log_channel = None
+    message: discord.Message | None = None
+    if not isinstance(log_channel, discord.TextChannel):
+        log_error = "The punishment log channel is unavailable."
+    else:
+        try:
+            old_rank = (
+                guild.get_role(case["demotion_old_rank_id"])
+                if case["demotion_old_rank_id"] is not None
+                else None
+            )
+            new_rank = (
+                guild.get_role(case["demotion_new_rank_id"])
+                if case["demotion_new_rank_id"] is not None
+                else None
+            )
+            issuer: discord.Member | str = (
+                guild.get_member(case["review_issuer_id"])
+                or f"<@{case['review_issuer_id']}>"
+            )
+            message = await log_channel.send(
+                view=build_punishment_view(
+                    member=member,
+                    punishment=case["punishment"],
+                    reason=case["reason"] or "Not provided",
+                    appealable="✅ Yes" if case["appealable"] else "❌ No",
+                    appealable_by=case["appealable_by"] or "❌",
+                    proof=case["review_proof"] or "Not provided",
+                    issuer=issuer,
+                    case_id=case_id,
+                    old_rank=old_rank,
+                    new_rank=new_rank,
+                ),
+                files=[discord.File(PUNISHMENT_BANNER_PATH, filename=PUNISHMENT_BANNER_FILENAME)],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log_error = None
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not log approved punishment case #{case_id}: {error}")
+            message = None
+            log_error = "The punishment was applied, but I could not post its case log."
+
+    if message is None:
+        restored = await restore_roles_after_failed_punishment(member, original_roles, case_id)
+        with database_connection() as connection:
+            connection.execute(
+                "UPDATE punishment_cases SET status = ? WHERE case_id = ? AND status = 'processing'",
+                ("pending_review" if restored else "needs_review", case_id),
+            )
+        await respond_privately(
+            interaction,
+            f"{log_error} "
+            + (
+                "The original roles were restored and the case remains pending review."
+                if restored
+                else "I could not restore the original roles; the case needs manual review."
+            ),
+        )
+        return
+
+    with database_connection() as connection:
+        connection.execute(
+            "UPDATE punishment_cases SET status = 'active', message_id = ? "
+            "WHERE case_id = ? AND status = 'processing'",
+            (message.id, case_id),
+        )
+        try:
+            converted_case_ids = json.loads(case["review_converted_case_ids"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            converted_case_ids = []
+            print(f"Invalid converted-case list saved for review case #{case_id}.")
+        if isinstance(converted_case_ids, list) and all(
+            isinstance(converted_id, int) for converted_id in converted_case_ids
+        ):
+            connection.executemany(
+                "UPDATE punishment_cases SET status = 'converted' "
+                "WHERE case_id = ? AND status = 'active'",
+                [(converted_id,) for converted_id in converted_case_ids],
+            )
+        else:
+            converted_case_ids = []
+
+    for converted_case_id in converted_case_ids:
+        converted_case = get_case(converted_case_id)
+        if converted_case is not None:
+            await set_original_case_marker(guild, converted_case, f"Converted to case #{case_id}")
+    if interaction.message is not None:
+        approved_embed = build_punishment_review_embed(case, case["review_tier"])
+        approved_embed.title = f"Punishment Approved — Case #{case_id}"
+        approved_embed.color = discord.Color.green()
+        try:
+            await interaction.message.edit(embed=approved_embed, view=None)
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not update approved review message for case #{case_id}: {error}")
+
+    ztp_status_message = ""
+    triggered_ztp = get_active_ztp(member.id, guild.id)
+    if triggered_ztp is not None:
+        termination_error = await terminate_for_ztp(
+            guild,
+            member,
+            interaction.user,
+            triggered_ztp,
+            case_id,
+        )
+        if termination_error:
+            ztp_status_message = f" ZTP termination needs attention: {termination_error}"
+    try:
+        await member.send(
+            view=build_punishment_view(
+                member=member,
+                punishment=case["punishment"],
+                reason=case["reason"] or "Not provided",
+                appealable="✅ Yes" if case["appealable"] else "❌ No",
+                appealable_by=case["appealable_by"] or "❌",
+                proof=case["review_proof"] or "Not provided",
+                issuer=issuer,
+                case_id=case_id,
+                old_rank=old_rank,
+                new_rank=new_rank,
+            ),
+            files=[discord.File(PUNISHMENT_BANNER_PATH, filename=PUNISHMENT_BANNER_FILENAME)],
+            allowed_mentions=discord.AllowedMentions(users=[member]),
+        )
+    except DISCORD_REQUEST_ERRORS as error:
+        print(f"Could not DM approved punishment case #{case_id}: {error}")
+        await respond_privately(
+            interaction,
+            f"Case #{case_id} was approved and applied, but the member DM failed.{ztp_status_message}",
+        )
+        return
+    await respond_privately(
+        interaction,
+        f"Case #{case_id} was approved, applied, logged, and sent by DM.{ztp_status_message}",
+    )
+
+
+async def handle_punishment_review(
+    interaction: discord.Interaction,
+    case_id: int,
+    action: str,
+) -> None:
+    guild = interaction.guild
+    case = get_case(case_id)
+    if (
+        guild is None
+        or case is None
+        or case["guild_id"] != guild.id
+        or case["status"] != "pending_review"
+    ):
+        await respond_privately(interaction, "This punishment review is no longer pending.")
+        return
+    if not isinstance(interaction.user, discord.Member) or not can_review_punishment(
+        interaction.user,
+        case["review_tier"],
+    ):
+        await respond_privately(
+            interaction,
+            "You do not have permission to review this case at its current tier.",
+        )
+        return
+
+    if action == "accept":
+        await interaction.response.defer(ephemeral=True)
+        await finish_punishment_review(interaction, case_id)
+        return
+    if action == "deny":
+        with database_connection() as connection:
+            updated = connection.execute(
+                "UPDATE punishment_cases SET status = 'review_denied' "
+                "WHERE case_id = ? AND status = 'pending_review' AND review_tier = ?",
+                (case_id, case["review_tier"]),
+            )
+        if updated.rowcount != 1:
+            await respond_privately(interaction, "This review was changed by another action.")
+            return
+        if interaction.message is not None:
+            embed = build_punishment_review_embed(case, case["review_tier"])
+            embed.title = f"Punishment Denied — Case #{case_id}"
+            embed.color = discord.Color.red()
+            await interaction.message.edit(embed=embed, view=None)
+        await respond_privately(interaction, f"Punishment case #{case_id} was denied.")
+        return
+
+    next_tier = {"IA": "Management", "Management": "BoD+"}.get(case["review_tier"])
+    if next_tier is None:
+        await respond_privately(interaction, "This case is already at the highest review tier.")
+        return
+    with database_connection() as connection:
+        updated = connection.execute(
+            "UPDATE punishment_cases SET review_tier = ? "
+            "WHERE case_id = ? AND status = 'pending_review' AND review_tier = ?",
+            (next_tier, case_id, case["review_tier"]),
+        )
+    if updated.rowcount != 1:
+        await respond_privately(interaction, "This review was changed by another action.")
+        return
+    updated_case = get_case(case_id)
+    if updated_case is None:
+        await respond_privately(interaction, "The review tier changed, but the case could not be reloaded.")
+        return
+    if interaction.message is not None:
+        try:
+            await interaction.message.edit(
+                embed=build_punishment_review_embed(updated_case, next_tier),
+                view=PunishmentReviewView(case_id, next_tier),
+            )
+        except DISCORD_REQUEST_ERRORS as error:
+            print(f"Could not update escalated review message for case #{case_id}: {error}")
+            await respond_privately(
+                interaction,
+                f"Case #{case_id} was escalated, but its message could not be updated. "
+                "Run /review-punishment with this case number to refresh it.",
+            )
+            return
+    await respond_privately(
+        interaction,
+        f"Case #{case_id} was escalated to "
+        f"{'Management Team' if next_tier == 'Management' else 'BoD+'}.",
+    )
+
+
+@bot.tree.command(
+    name="review-punishment",
+    description="Look up a punishment case and post or refresh its review.",
+)
+@app_commands.guild_only()
+@app_commands.check(staff_only)
+@app_commands.describe(case_number="Case number of the punishment awaiting review")
+async def review_punishment(interaction: discord.Interaction, case_number: int) -> None:
+    guild = interaction.guild
+    if guild is None or case_number < 1:
+        await respond_privately(interaction, "Enter a valid case number from this server.")
+        return
+    case = get_case(case_number)
+    if (
+        case is None
+        or case["guild_id"] != guild.id
+        or case["status"] != "pending_review"
+    ):
+        await respond_privately(
+            interaction,
+            "That case was not found as a punishment awaiting review in this server.",
+        )
+        return
+    message, error = await publish_punishment_review(guild, case)
+    if error:
+        await respond_privately(interaction, error)
+        return
+    if message is None:
+        await respond_privately(interaction, "I could not publish the punishment review.")
+        return
+    await respond_privately(
+        interaction,
+        f"Review for case #{case_number}: {message.jump_url}",
+    )
+
+
 @bot.tree.command(
     name="staff-member-punish",
     description="Record a staff punishment and apply role changes when needed.",
@@ -4312,6 +4863,7 @@ bot.tree.add_command(cases_group)
     member="Staff member receiving the punishment",
     punishment="Punishment to issue",
     reason="Required reason for the punishment",
+    review_punishment="Review Punishment: hold an Infraction for approval before it takes effect",
     appealable="Whether this punishment can be appealed",
     appealable_by="Minimum team that may review an appeal, or not appealable",
     proof="Proof channel, link, or confidentiality note (for example, Confidential to BoD+)",
@@ -4330,7 +4882,14 @@ async def staff_member_punish(
     proof_image: discord.Attachment | None = None,
     old_rank: discord.Role | None = None,
     new_rank: discord.Role | None = None,
+    review_punishment: bool = False,
 ) -> None:
+    if review_punishment and punishment.value != "Infraction":
+        await respond_privately(
+            interaction,
+            "Review Punishment can only be selected for an Infraction.",
+        )
+        return
     if len(reason) > 1024 or (proof is not None and len(proof) > 1024):
         await respond_privately(
             interaction,
@@ -4510,16 +5069,19 @@ async def staff_member_punish(
     with database_connection() as connection:
         connection.execute(
             "UPDATE punishment_cases SET member_id = ?, punishment = ?, reason = ?, "
-            "appealable = ?, appealable_by = ?, status = 'pending', created_at = ?, "
+            "appealable = ?, appealable_by = ?, status = ?, created_at = ?, "
             "removed_role_ids = ?, guild_id = ?, demotion_old_rank_id = ?, "
             "demotion_new_rank_id = ?, demotion_added_role_ids = ?, "
-            "termination_due_at = ? WHERE case_id = ?",
+            "termination_due_at = ?, review_tier = ?, review_add_role_ids = ?, "
+            "review_remove_role_ids = ?, review_converted_case_ids = ?, "
+            "review_proof = ?, review_issuer_id = ? WHERE case_id = ?",
             (
                 member.id,
                 case_punishment,
                 case_reason,
                 int(can_appeal),
                 appeal_reviewer if can_appeal else "no",
+                "pending_review" if review_punishment else "pending",
                 created_at,
                 json.dumps(saved_removed_role_ids),
                 guild.id,
@@ -4529,9 +5091,38 @@ async def staff_member_punish(
                 if punishment.value == "Demotion"
                 else None,
                 termination_due_at,
+                "IA" if review_punishment else None,
+                json.dumps([role.id for role in roles_to_add]) if review_punishment else None,
+                json.dumps([role.id for role in roles_to_remove]) if review_punishment else None,
+                json.dumps(converted_case_ids) if review_punishment else None,
+                "\n".join(proof_parts) if proof_parts else None,
+                interaction.user.id if review_punishment else None,
                 case_id,
             ),
         )
+
+    if review_punishment:
+        review_case = get_case(case_id)
+        if review_case is None:
+            await respond_privately(
+                interaction,
+                f"Case #{case_id} was created, but I could not reload it for review.",
+            )
+            return
+        _, review_error = await publish_punishment_review(guild, review_case)
+        if review_error:
+            await respond_privately(
+                interaction,
+                f"Case #{case_id} is pending review, but I could not post its review: "
+                f"{review_error} Use /review-punishment with case number {case_id} to retry.",
+            )
+            return
+        await respond_privately(
+            interaction,
+            f"Infraction case #{case_id} is pending review by the Internal Affairs Team. "
+            "No punishment roles were changed.",
+        )
+        return
 
     if changes_roles:
         roles_to_remove_ids = {role.id for role in roles_to_remove}
@@ -4848,6 +5439,7 @@ async def open_investigation(
         None,
         None,
         None,
+        review_punishment=False,
     )
 
 
