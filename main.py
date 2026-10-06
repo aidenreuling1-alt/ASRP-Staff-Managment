@@ -4863,7 +4863,7 @@ async def review_punishment(interaction: discord.Interaction, case_number: int) 
     member="Staff member receiving the punishment",
     punishment="Punishment to issue",
     reason="Required reason for the punishment",
-    review_punishment="Review Punishment: hold an Infraction for approval before it takes effect",
+    review_punishment="Review Punishment: hold this punishment for approval before it takes effect",
     appealable="Whether this punishment can be appealed",
     appealable_by="Minimum team that may review an appeal, or not appealable",
     proof="Proof channel, link, or confidentiality note (for example, Confidential to BoD+)",
@@ -4884,12 +4884,6 @@ async def staff_member_punish(
     new_rank: discord.Role | None = None,
     review_punishment: bool = False,
 ) -> None:
-    if review_punishment and punishment.value != "Infraction":
-        await respond_privately(
-            interaction,
-            "Review Punishment can only be selected for an Infraction.",
-        )
-        return
     if len(reason) > 1024 or (proof is not None and len(proof) > 1024):
         await respond_privately(
             interaction,
@@ -5119,7 +5113,7 @@ async def staff_member_punish(
             return
         await respond_privately(
             interaction,
-            f"Infraction case #{case_id} is pending review by the Internal Affairs Team. "
+            f"Punishment case #{case_id} is pending review by the Internal Affairs Team. "
             "No punishment roles were changed.",
         )
         return
