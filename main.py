@@ -1043,44 +1043,70 @@ def get_demotion_role_changes(
     if old_rank not in member.roles:
         return "The member does not currently have the selected Old Rank role."
 
-    ia_rank_names = (
-        "Trial Internal Affairs",
-        "Junior Internal Affairs",
-        "Internal Affairs",
-        "Senior Internal Affairs",
-        "Internal Affairs Director",
+    team_ranks = {
+        "Moderation Team": (
+            "Trial Moderator",
+            "Junior Moderator",
+            "Moderator",
+            "Senior Moderator",
+        ),
+        "Administration Team": (
+            "Trial Administrator",
+            "Junior Administrator",
+            "Administrator",
+            "Senior Administrator",
+        ),
+        "Internal Affairs Team": (
+            "Trial Internal Affairs",
+            "Junior Internal Affairs",
+            "Internal Affairs",
+            "Senior Internal Affairs",
+            "Internal Affairs Director",
+        ),
+        "Management Team": (
+            "Trial Managment",
+            "Junior Managment",
+            "Managment",
+            "Senior Managment",
+            "Director Of Managment",
+        ),
+    }
+
+    old_team_role_id = next(
+        (
+            STAFF_ROLE_IDS[team_name]
+            for team_name, ranks in team_ranks.items()
+            if old_rank.id in {STAFF_ROLE_IDS[rank_name] for rank_name in ranks}
+        ),
+        None,
     )
-    management_rank_names = (
-        "Trial Managment",
-        "Junior Managment",
-        "Managment",
-        "Senior Managment",
-        "Director Of Managment",
+    new_team_role_id = next(
+        (
+            STAFF_ROLE_IDS[team_name]
+            for team_name, ranks in team_ranks.items()
+            if new_rank.id in {STAFF_ROLE_IDS[rank_name] for rank_name in ranks}
+        ),
+        None,
     )
-    ia_rank_ids = {STAFF_ROLE_IDS[name] for name in ia_rank_names}
-    management_rank_ids = {STAFF_ROLE_IDS[name] for name in management_rank_names}
-    old_is_ia = old_rank.id in ia_rank_ids
-    new_is_ia = new_rank.id in ia_rank_ids
-    old_is_management = old_rank.id in management_rank_ids
-    new_is_management = new_rank.id in management_rank_ids
 
     role_ids_to_remove = {old_rank.id}
     role_ids_to_add = {new_rank.id}
-    if old_is_ia and not new_is_ia:
-        role_ids_to_remove.update(
-            {STAFF_ROLE_IDS["Internal Affairs Team"], STAFF_ROLE_IDS["HR"]}
-        )
-    if new_is_ia and not old_is_ia:
-        role_ids_to_add.update(
-            {STAFF_ROLE_IDS["Internal Affairs Team"], STAFF_ROLE_IDS["HR"]}
-        )
-    if old_is_management and not new_is_management:
+    team_role_ids = {STAFF_ROLE_IDS[team_name] for team_name in team_ranks}
+    if old_team_role_id is not None:
+        role_ids_to_remove.add(old_team_role_id)
+    if new_team_role_id is not None:
+        role_ids_to_add.add(new_team_role_id)
+    if old_team_role_id != new_team_role_id:
+        role_ids_to_remove.update(team_role_ids)
+
+    if new_team_role_id == STAFF_ROLE_IDS["Internal Affairs Team"]:
+        role_ids_to_add.add(STAFF_ROLE_IDS["HR"])
         role_ids_to_remove.add(STAFF_ROLE_IDS["SHR"])
-    if new_is_management and not old_is_management:
+    elif new_team_role_id == STAFF_ROLE_IDS["Management Team"]:
         role_ids_to_add.add(STAFF_ROLE_IDS["SHR"])
         role_ids_to_remove.add(STAFF_ROLE_IDS["HR"])
-    if old_is_management and not new_is_management and new_is_ia:
-        role_ids_to_add.add(STAFF_ROLE_IDS["HR"])
+    else:
+        role_ids_to_remove.update({STAFF_ROLE_IDS["HR"], STAFF_ROLE_IDS["SHR"]})
 
     guild = member.guild
     missing_role_ids = [
